@@ -1,159 +1,74 @@
-from typing import Any, List, Optional
+from typing import Any
+
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
-from sklearn.tree import plot_tree, DecisionTreeRegressor
+from sklearn.tree import plot_tree
+from sklearn.tree import DecisionTreeRegressor
 from sklearn.linear_model import LinearRegression
 from sklearn.utils.validation import check_is_fitted
-from tqdm import tqdm
 
 from pearl.agent import RLAgent
 from pearl.env import RLEnvironment
 from pearl.mask import Mask
 from pearl.method import ExplainabilityMethod
 
-from pearl.lab.visual import VisualizationMethod
-from pearl.lab.annotations import Param
-
-class LMUTVisualizationParams:
-    action: Param(int) = 0
-    agent_idx: Param(int) = 0
-
 
 class LinearModelUTreeExplainability(ExplainabilityMethod):
-    """
-    Linear Model U-Tree (LMUT) explainability method.
-    
-    Combines decision trees for feature selection with linear models for each leaf node
-    to provide interpretable explanations of agent behavior.
-    """
-    
-    def __init__(self, device: torch.device, mask: Mask, 
-                 max_depth: int = 5, min_samples_leaf: int = 5,
-                 num_training_samples: int = 1000):
-        """
-        Initialize LMUT explainability method.
-        
-        Args:
-            device: PyTorch device for computations
-            mask: Mask object for computing attribution scores
-            max_depth: Maximum depth of decision trees
-            min_samples_leaf: Minimum samples per leaf node
-            num_training_samples: Number of training samples to collect
-        """
+    def __init__(self, device, mask: Mask):
         super().__init__()
         self.device = device
+        self.explainer = None
         self.mask = mask
-        self.max_depth = max_depth
-        self.min_samples_leaf = min_samples_leaf
-        self.num_training_samples = num_training_samples
-        
-        # Core components
-        self.agents: Optional[List[RLAgent]] = None
-        self.trees: Optional[List[DecisionTreeRegressor]] = None
-        self.linear_models: Optional[List[LinearRegression]] = None
-        
-        # Training data
-        self.training_data: List[np.ndarray] = []
-        self.training_targets: List[np.ndarray] = []
-        self.original_shape: Optional[tuple] = None
-        self.input_dim: Optional[int] = None
-        
-        # Visualization state
-        self.last_explain: Optional[List[np.ndarray]] = None
-        self.last_obs: Optional[np.ndarray] = None
-        self.last_action: Optional[int] = None
+        self.agents = None
+        self.trees = None
+        self.linear_models = None
+        self.training_data = []
+        self.training_targets = []
+        self.original_shape = None
 
     def set(self, env: RLEnvironment):
-        """Set the environment and initialize shape information."""
         super().set(env)
         obs = env.get_observations()
-        self.original_shape = obs.shape
+        self.original_shape = obs.shape  # Store original shape for later reshaping
         self.input_dim = np.prod(obs.shape[1:])  # Total number of features
 
-    def prepare(self, agents: RLAgent):
-        """Prepare the explainer with agents and initialize models."""
-        # Handle single agent case
-        if not isinstance(agents, list):
-            agents = [agents]
-        
+    def prepare(self, agents: list[RLAgent]):
         self.agents = agents
         self.trees = []
         self.linear_models = []
         
         for _ in agents:
             # Initialize a decision tree for feature selection
-            tree = DecisionTreeRegressor(
-                max_depth=self.max_depth, 
-                min_samples_leaf=self.min_samples_leaf
-            )
+            tree = DecisionTreeRegressor(max_depth=5, min_samples_leaf=5)
             # Initialize a linear model for each leaf node
             linear_model = LinearRegression()
             self.trees.append(tree)
             self.linear_models.append(linear_model)
 
     def onStep(self, action: Any):
-        """Called before step - store the action for later use."""
-        self.last_action = action
-
-    def onStepAfter(self, action: Any, reward: dict, done: bool, info: dict):
-        """Called after step - no action needed for LMUT."""
+        # nothing for LMUT
         pass
 
-    def add_training_data(self, obs: np.ndarray, q_values: np.ndarray):
-        """Add training data for fitting the models."""
+    def onStepAfter(self, action: Any):
+        # nothing for LMUT
+        pass
+
+    def add_training_data(self, obs, q_values):
+        """Add training data for fitting the models"""
         self.training_data.append(obs)
         self.training_targets.append(q_values)
 
-    def collect_training_data(self, num_samples: Optional[int] = None):
-        """Collect training data by running the environment and gathering Q-values from agents."""
-        if num_samples is None:
-            num_samples = self.num_training_samples
-            
-        if self.agents is None:
-            raise ValueError("Agents not set. Call prepare() first.")
-        
-        print(f"Collecting {num_samples} training samples...")
-        for _ in tqdm(range(num_samples), desc="Collecting training samples"):
-            obs = self.env.get_observations()
-            obs_tensor = torch.as_tensor(obs, dtype=torch.float, device=self.device)
-            
-            # Get Q-values from all agents
-            q_values = []
-            for agent in self.agents:
-                with torch.no_grad():
-                    q_vals = agent.get_q_net()(obs_tensor).cpu().numpy()
-                    # Take the maximum Q-value for each agent
-                    q_values.append(np.max(q_vals, axis=1))
-            q_values = np.array(q_values).T  # Shape: (batch_size, n_agents)
-            
-            # Reshape observation to 2D array (flatten all dimensions except batch)
-            obs_reshaped = obs.reshape(obs.shape[0], -1)  # (batch_size, features)
-            self.add_training_data(obs_reshaped, q_values)
-            
-            # Take a random action to get new observations
-            action = self.env.action_space.sample()
-            state, reward_dict, terminated, truncated, info = self.env.step(action)
-            if terminated:
-                self.env.reset()
-
     def fit_models(self):
-        """Fit the decision trees and linear models with collected data."""
+        """Fit the decision trees and linear models with collected data"""
         if not self.training_data or not self.training_targets:
-            raise ValueError("No training data available. Call collect_training_data() first.")
+            raise ValueError("No training data available. Call add_training_data first.")
 
-        if self.trees is None or self.linear_models is None:
-            raise ValueError("Models not initialized. Call prepare() first.")
-
-        print("Fitting LMUT models...")
-        
         # Convert training data to 2D array
         X = np.vstack(self.training_data)  # Stack all observations into a 2D array
         y = np.vstack(self.training_targets)  # Stack all targets into a 2D array
 
         for i, (tree, linear_model) in enumerate(zip(self.trees, self.linear_models)):
-            print(f"Fitting models for agent {i}...")
-            
             # Fit the decision tree
             tree.fit(X, y[:, i])
             
@@ -167,8 +82,7 @@ class LinearModelUTreeExplainability(ExplainabilityMethod):
                 if np.sum(mask) > 1:  # Only fit if we have enough samples
                     linear_model.fit(X[mask], y[mask, i])
 
-    def explain(self, obs: np.ndarray) -> List[np.ndarray]:
-        """Generate explanations using the fitted LMUT models."""
+    def explain(self, obs) -> np.ndarray | Any:
         if self.trees is None or self.linear_models is None:
             raise ValueError("Explainer not set. Please call prepare() first.")
 
@@ -179,6 +93,7 @@ class LinearModelUTreeExplainability(ExplainabilityMethod):
         except Exception as e:
             raise ValueError("Models not fitted. Call fit_models() first.") from e
 
+        obs_tensor = torch.as_tensor(obs, dtype=torch.float, device=self.device)
         result = []
         
         for i, (tree, linear_model) in enumerate(zip(self.trees, self.linear_models)):
@@ -198,7 +113,7 @@ class LinearModelUTreeExplainability(ExplainabilityMethod):
             if len(obs_shape) == 4:  # Image-based environment (e.g., Space Invaders)
                 # Shape: (batch, channels, height, width)
                 # Reshape to original image shape
-                reshaped_importance = combined_importance.reshape(obs_shape[1:])
+                reshaped_importance = combined_importance.reshape(obs_shape)
                 # Expand to include action channels
                 expanded_importance = np.expand_dims(reshaped_importance, axis=-1)
                 expanded_importance = np.repeat(expanded_importance, n_actions, axis=-1)
@@ -218,7 +133,7 @@ class LinearModelUTreeExplainability(ExplainabilityMethod):
                 # Handle other cases (1D, 3D, etc.)
                 # Try to reshape to original shape and add action dimension
                 try:
-                    reshaped_importance = combined_importance.reshape(obs_shape[1:])
+                    reshaped_importance = combined_importance.reshape(obs_shape)
                     expanded_importance = np.expand_dims(reshaped_importance, axis=-1)
                     expanded_importance = np.repeat(expanded_importance, n_actions, axis=-1)
                 except:
@@ -229,18 +144,12 @@ class LinearModelUTreeExplainability(ExplainabilityMethod):
                         expanded_importance[0, :, 0, 0, a] = reshaped_importance
             
             result.append(expanded_importance)
-        
-        # Store for visualization
-        self.last_explain = result
-        self.last_obs = obs
-        
+            
         return result
 
-    def value(self, obs: np.ndarray) -> List[float]:
-        """Compute attribution values for the current observation."""
+    def value(self, obs) -> list[float]:
         explains = self.explain(obs)
         values = []
-        
         for i, explain in enumerate(explains):
             agent = self.agents[i]
             # Reshape observation back to original shape for the mask
@@ -252,86 +161,12 @@ class LinearModelUTreeExplainability(ExplainabilityMethod):
             action = agent.predict(obs_tensor)
             values.append(scores[action])
             
+
         return values
+    
+    
 
-    def supports(self, m: VisualizationMethod) -> bool:
-        """Check if the method supports the given visualization type."""
-        if not isinstance(m, VisualizationMethod):
-            m = VisualizationMethod(m)
-        return m == VisualizationMethod.RGB_ARRAY
-
-    def getVisualizationParamsType(self, m: VisualizationMethod) -> type | None:
-        """Get the visualization parameters type for the given method."""
-        if not isinstance(m, VisualizationMethod):
-            m = VisualizationMethod(m)
-        return LMUTVisualizationParams if m == VisualizationMethod.RGB_ARRAY else None
-
-    def getVisualization(self, m: VisualizationMethod, params: Any = None) -> np.ndarray | dict | None:
-        """Generate visualization for the given method."""
-        if self.last_explain is None or self.last_obs is None:
-            return np.zeros((84, 84, 3), dtype=np.float32)
-        
-        if not isinstance(m, VisualizationMethod):
-            m = VisualizationMethod(m)
-        
-        if m == VisualizationMethod.RGB_ARRAY:
-            # Get parameters
-            if params is None:
-                params = LMUTVisualizationParams()
-            
-            agent_idx = getattr(params, 'agent_idx', 0)
-            action = getattr(params, 'action', self.last_action or 0)
-            
-            if agent_idx >= len(self.last_explain):
-                return np.zeros((84, 84, 3), dtype=np.float32)
-            
-            # Get the explanation for the specified agent
-            explain = self.last_explain[agent_idx]
-            
-            # Extract the heatmap for the specified action
-            if explain.ndim == 5:  # (batch, channels, height, width, actions)
-                heatmap = explain[0, :, :, :, action]  # Remove batch and action dims
-            elif explain.ndim == 4:  # (channels, height, width, actions)
-                heatmap = explain[:, :, :, action]
-            elif explain.ndim == 3:  # (height, width, actions)
-                heatmap = explain[:, :, action]
-            else:
-                # Fallback: average across all dimensions except spatial
-                heatmap = np.mean(explain, axis=tuple(range(explain.ndim - 2)))
-            
-            # Convert to 2D heatmap if needed
-            if heatmap.ndim > 2:
-                heatmap = np.mean(heatmap, axis=0)  # Average across channels
-            
-            # Normalize heatmap
-            scale = np.max(np.abs(heatmap)) + 1e-8
-            heatmap_norm = (heatmap + scale) / (2 * scale)
-            
-            # Create RGB visualization
-            obs_img = np.zeros((heatmap.shape[0], heatmap.shape[1], 3), dtype=np.float32)
-            
-            # Create masks for positive (red) and negative (blue) attributions
-            red_mask = heatmap_norm >= 0.6
-            blue_mask = heatmap_norm <= 0.4
-            important = red_mask | blue_mask
-            
-            # Create colored overlay
-            colored = np.zeros_like(obs_img)
-            colored[red_mask, 0] = heatmap_norm[red_mask]  # Red for positive
-            colored[blue_mask, 2] = 1 - heatmap_norm[blue_mask]  # Blue for negative
-            
-            # Create alpha channel for blending
-            alpha = np.zeros((obs_img.shape[0], obs_img.shape[1], 1), dtype=np.float32)
-            alpha[important] = 0.5
-            
-            # Blend the original image with the colored heatmap
-            blended = (1 - alpha) * obs_img + alpha * colored
-            return np.clip(blended, 0, 1)
-        
-        return None
-
-    def visualize_tree_structure(self, agent_idx: int = 0, save_path: Optional[str] = None, 
-                                show_plot: bool = True, feature_names: Optional[List[str]] = None) -> plt.Figure:
+    def visualize_tree_structure(self, agent_idx=0, save_path=None, show_plot=True, feature_names=None):
         """
         Visualize the decision tree structure.
         
@@ -340,9 +175,6 @@ class LinearModelUTreeExplainability(ExplainabilityMethod):
             save_path: Path to save the visualization (optional)
             show_plot: Whether to display the plot (default: True)
             feature_names: List of feature names to display instead of x[i] (optional)
-            
-        Returns:
-            matplotlib Figure object
         """
         if self.trees is None:
             raise ValueError("Explainer not set. Please call prepare() first.")
@@ -378,14 +210,14 @@ class LinearModelUTreeExplainability(ExplainabilityMethod):
                 num_features = np.prod(obs_shape[1:])
                 feature_names = [f"feature_{i}" for i in range(num_features)]
         
-        # Create tree visualization with wide figure and better spacing
-        fig, ax = plt.subplots(1, 1, figsize=(35, 20))
+        # Create tree visualization with much wider figure and better spacing
+        fig, ax = plt.subplots(1, 1, figsize=(35, 20))  # Even wider and taller
         
         # Use sklearn's tree plotting with parameters to prevent collapsing
         plot_tree(tree, ax=ax, filled=True, rounded=True, fontsize=10, 
                  feature_names=feature_names, class_names=None, precision=3,
                  proportion=True, max_depth=None)
-        ax.set_title(f'LMUT Decision Tree Structure for Agent {agent_idx}', fontsize=18, pad=25)
+        ax.set_title(f'Decision Tree Structure for Agent {agent_idx}', fontsize=18, pad=25)
         
         # Adjust layout to prevent node overlapping
         plt.tight_layout(pad=2.0)
@@ -399,3 +231,427 @@ class LinearModelUTreeExplainability(ExplainabilityMethod):
             plt.close()
         
         return fig
+
+    def visualize_feature_importance_bar(self, agent_idx=0, top_k=20, save_path=None, show_plot=True, feature_names=None):
+        """
+        Visualize feature importance as a bar chart.
+        
+        Args:
+            agent_idx: Index of the agent to visualize (default: 0)
+            top_k: Number of top features to display (default: 20)
+            save_path: Path to save the visualization (optional)
+            show_plot: Whether to display the plot (default: True)
+            feature_names: List of feature names to display (optional)
+        """
+        if self.trees is None or self.linear_models is None:
+            raise ValueError("Explainer not set. Please call prepare() first.")
+
+        try:
+            check_is_fitted(self.trees[agent_idx])
+        except Exception as e:
+            raise ValueError("Models not fitted. Call fit_models() first.") from e
+
+        tree = self.trees[agent_idx]
+        linear_model = self.linear_models[agent_idx]
+        
+        # Get feature importances
+        tree_importance = tree.feature_importances_
+        linear_importance = linear_model.coef_ if hasattr(linear_model, 'coef_') else np.zeros(self.input_dim)
+        combined_importance = (tree_importance + linear_importance) / 2
+        
+        # Auto-generate feature names if not provided
+        if feature_names is None:
+            obs_shape = self.original_shape
+            if len(obs_shape) == 4:  # Image-based environment
+                channels, height, width = obs_shape[1], obs_shape[2], obs_shape[3]
+                feature_names = []
+                for c in range(channels):
+                    for h in range(height):
+                        for w in range(width):
+                            feature_names.append(f"ch{c}_pos_{h}x{w}")
+            elif len(obs_shape) == 2:  # Tabular environment
+                num_features = obs_shape[1]
+                feature_names = [f"feature_{i}" for i in range(num_features)]
+            else:
+                num_features = np.prod(obs_shape[1:])
+                feature_names = [f"feature_{i}" for i in range(num_features)]
+        
+        # Get top k features
+        top_indices = np.argsort(combined_importance)[-top_k:][::-1]
+        top_importance = combined_importance[top_indices]
+        top_names = [feature_names[i] for i in top_indices]
+        
+        # Create the plot
+        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(15, 12))
+        
+        # Combined importance
+        bars1 = ax1.barh(range(len(top_names)), top_importance, color='skyblue', alpha=0.7)
+        ax1.set_yticks(range(len(top_names)))
+        ax1.set_yticklabels(top_names, fontsize=10)
+        ax1.set_xlabel('Combined Feature Importance', fontsize=12)
+        ax1.set_title(f'Top {top_k} Features - Combined Importance (Agent {agent_idx})', fontsize=14)
+        ax1.invert_yaxis()
+        
+        # Tree importance
+        tree_top_importance = tree_importance[top_indices]
+        bars2 = ax2.barh(range(len(top_names)), tree_top_importance, color='lightgreen', alpha=0.7)
+        ax2.set_yticks(range(len(top_names)))
+        ax2.set_yticklabels(top_names, fontsize=10)
+        ax2.set_xlabel('Tree Feature Importance', fontsize=12)
+        ax2.set_title(f'Top {top_k} Features - Tree Importance (Agent {agent_idx})', fontsize=14)
+        ax2.invert_yaxis()
+        
+        # Linear importance
+        linear_top_importance = linear_importance[top_indices]
+        bars3 = ax3.barh(range(len(top_names)), linear_top_importance, color='salmon', alpha=0.7)
+        ax3.set_yticks(range(len(top_names)))
+        ax3.set_yticklabels(top_names, fontsize=10)
+        ax3.set_xlabel('Linear Model Coefficients', fontsize=12)
+        ax3.set_title(f'Top {top_k} Features - Linear Coefficients (Agent {agent_idx})', fontsize=14)
+        ax3.invert_yaxis()
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        
+        if show_plot:
+            plt.show()
+        else:
+            plt.close()
+        
+        return fig
+
+    def visualize_feature_importance_heatmap(self, agent_idx=0, save_path=None, show_plot=True, cmap='viridis'):
+        """
+        Visualize feature importance as a heatmap (especially useful for image-based environments).
+        
+        Args:
+            agent_idx: Index of the agent to visualize (default: 0)
+            save_path: Path to save the visualization (optional)
+            show_plot: Whether to display the plot (default: True)
+            cmap: Colormap to use (default: 'viridis')
+        """
+        if self.trees is None or self.linear_models is None:
+            raise ValueError("Explainer not set. Please call prepare() first.")
+
+        try:
+            check_is_fitted(self.trees[agent_idx])
+        except Exception as e:
+            raise ValueError("Models not fitted. Call fit_models() first.") from e
+
+        tree = self.trees[agent_idx]
+        linear_model = self.linear_models[agent_idx]
+        
+        # Get feature importances
+        tree_importance = tree.feature_importances_
+        linear_importance = linear_model.coef_ if hasattr(linear_model, 'coef_') else np.zeros(self.input_dim)
+        combined_importance = (tree_importance + linear_importance) / 2
+        
+        obs_shape = self.original_shape
+        
+        if len(obs_shape) == 4:  # Image-based environment
+            # Shape: (batch, channels, height, width)
+            channels, height, width = obs_shape[1], obs_shape[2], obs_shape[3]
+            
+            # Create subplots for each channel
+            fig, axes = plt.subplots(2, channels, figsize=(5*channels, 8))
+            if channels == 1:
+                axes = axes.reshape(2, 1)
+            
+            for c in range(channels):
+                # Extract importance for this channel
+                start_idx = c * height * width
+                end_idx = (c + 1) * height * width
+                channel_importance = combined_importance[start_idx:end_idx].reshape(height, width)
+                
+                # Combined importance heatmap
+                im1 = axes[0, c].imshow(channel_importance, cmap=cmap, aspect='auto')
+                axes[0, c].set_title(f'Channel {c} - Combined Importance', fontsize=12)
+                axes[0, c].set_xlabel('Width')
+                axes[0, c].set_ylabel('Height')
+                plt.colorbar(im1, ax=axes[0, c])
+                
+                # Tree importance heatmap
+                tree_channel_importance = tree_importance[start_idx:end_idx].reshape(height, width)
+                im2 = axes[1, c].imshow(tree_channel_importance, cmap=cmap, aspect='auto')
+                axes[1, c].set_title(f'Channel {c} - Tree Importance', fontsize=12)
+                axes[1, c].set_xlabel('Width')
+                axes[1, c].set_ylabel('Height')
+                plt.colorbar(im2, ax=axes[1, c])
+            
+            plt.suptitle(f'Feature Importance Heatmaps for Agent {agent_idx}', fontsize=16)
+            
+        elif len(obs_shape) == 2:  # Tabular environment
+            # Create a simple 1D heatmap
+            fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(15, 8))
+            
+            # Combined importance
+            im1 = ax1.imshow(combined_importance.reshape(1, -1), cmap=cmap, aspect='auto')
+            ax1.set_title(f'Combined Feature Importance (Agent {agent_idx})', fontsize=14)
+            ax1.set_xlabel('Feature Index')
+            ax1.set_yticks([])
+            plt.colorbar(im1, ax=ax1)
+            
+            # Tree importance
+            im2 = ax2.imshow(tree_importance.reshape(1, -1), cmap=cmap, aspect='auto')
+            ax2.set_title(f'Tree Feature Importance (Agent {agent_idx})', fontsize=14)
+            ax2.set_xlabel('Feature Index')
+            ax2.set_yticks([])
+            plt.colorbar(im2, ax=ax2)
+            
+            # Linear importance
+            im3 = ax3.imshow(linear_importance.reshape(1, -1), cmap=cmap, aspect='auto')
+            ax3.set_title(f'Linear Model Coefficients (Agent {agent_idx})', fontsize=14)
+            ax3.set_xlabel('Feature Index')
+            ax3.set_yticks([])
+            plt.colorbar(im3, ax=ax3)
+            
+        else:
+            # Generic case
+            fig, ax = plt.subplots(1, 1, figsize=(15, 4))
+            im = ax.imshow(combined_importance.reshape(1, -1), cmap=cmap, aspect='auto')
+            ax.set_title(f'Feature Importance Heatmap (Agent {agent_idx})', fontsize=14)
+            ax.set_xlabel('Feature Index')
+            ax.set_yticks([])
+            plt.colorbar(im, ax=ax)
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        
+        if show_plot:
+            plt.show()
+        else:
+            plt.close()
+        
+        return fig
+
+    def visualize_feature_importance_comparison(self, save_path=None, show_plot=True, top_k=10, feature_names=None):
+        """
+        Compare feature importance across all agents.
+        
+        Args:
+            save_path: Path to save the visualization (optional)
+            show_plot: Whether to display the plot (default: True)
+            top_k: Number of top features to display (default: 10)
+            feature_names: List of feature names to display (optional)
+        """
+        if self.trees is None or self.linear_models is None:
+            raise ValueError("Explainer not set. Please call prepare() first.")
+
+        # Check if all models are fitted
+        for i, tree in enumerate(self.trees):
+            try:
+                check_is_fitted(tree)
+            except Exception as e:
+                raise ValueError(f"Model for agent {i} not fitted. Call fit_models() first.") from e
+
+        # Get feature importances for all agents
+        all_importances = []
+        for i, (tree, linear_model) in enumerate(zip(self.trees, self.linear_models)):
+            tree_importance = tree.feature_importances_
+            linear_importance = linear_model.coef_ if hasattr(linear_model, 'coef_') else np.zeros(self.input_dim)
+            combined_importance = (tree_importance + linear_importance) / 2
+            all_importances.append(combined_importance)
+        
+        all_importances = np.array(all_importances)  # Shape: (n_agents, n_features)
+        
+        # Get top k features based on average importance across agents
+        avg_importance = np.mean(all_importances, axis=0)
+        top_indices = np.argsort(avg_importance)[-top_k:][::-1]
+        
+        # Auto-generate feature names if not provided
+        if feature_names is None:
+            obs_shape = self.original_shape
+            if len(obs_shape) == 4:  # Image-based environment
+                channels, height, width = obs_shape[1], obs_shape[2], obs_shape[3]
+                feature_names = []
+                for c in range(channels):
+                    for h in range(height):
+                        for w in range(width):
+                            feature_names.append(f"ch{c}_pos_{h}x{w}")
+            elif len(obs_shape) == 2:  # Tabular environment
+                num_features = obs_shape[1]
+                feature_names = [f"feature_{i}" for i in range(num_features)]
+            else:
+                num_features = np.prod(obs_shape[1:])
+                feature_names = [f"feature_{i}" for i in range(num_features)]
+        
+        # Create the comparison plot
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 12))
+        
+        # Bar chart comparing agents
+        x = np.arange(len(top_indices))
+        width = 0.8 / len(self.agents)
+        
+        for i, agent_importance in enumerate(all_importances):
+            top_agent_importance = agent_importance[top_indices]
+            ax1.bar(x + i * width, top_agent_importance, width, 
+                   label=f'Agent {i}', alpha=0.7)
+        
+        ax1.set_xlabel('Feature')
+        ax1.set_ylabel('Feature Importance')
+        ax1.set_title(f'Top {top_k} Features - Comparison Across Agents', fontsize=14)
+        ax1.set_xticks(x + width * (len(self.agents) - 1) / 2)
+        # Use feature names if available, otherwise use indices
+        if feature_names and len(feature_names) > max(top_indices):
+            top_feature_names = [feature_names[idx] for idx in top_indices]
+            ax1.set_xticklabels(top_feature_names, rotation=45, ha='right')
+        else:
+            ax1.set_xticklabels([f'F{idx}' for idx in top_indices])
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        
+        # Heatmap of all agents and top features
+        top_features_importance = all_importances[:, top_indices]
+        im = ax2.imshow(top_features_importance, cmap='viridis', aspect='auto')
+        ax2.set_xlabel('Feature')
+        ax2.set_ylabel('Agent Index')
+        ax2.set_title(f'Feature Importance Heatmap - Top {top_k} Features', fontsize=14)
+        ax2.set_xticks(range(len(top_indices)))
+        # Use feature names if available, otherwise use indices
+        if feature_names and len(feature_names) > max(top_indices):
+            top_feature_names = [feature_names[idx] for idx in top_indices]
+            ax2.set_xticklabels(top_feature_names, rotation=45, ha='right')
+        else:
+            ax2.set_xticklabels([f'F{idx}' for idx in top_indices])
+        ax2.set_yticks(range(len(self.agents)))
+        ax2.set_yticklabels([f'Agent {i}' for i in range(len(self.agents))])
+        plt.colorbar(im, ax=ax2)
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        
+        if show_plot:
+            plt.show()
+        else:
+            plt.close()
+        
+        return fig
+
+    def visualize_feature_importance_summary(self, save_path=None, show_plot=True):
+        """
+        Create a comprehensive summary of feature importance across all agents.
+        
+        Args:
+            save_path: Path to save the visualization (optional)
+            show_plot: Whether to display the plot (default: True)
+        """
+        if self.trees is None or self.linear_models is None:
+            raise ValueError("Explainer not set. Please call prepare() first.")
+
+        # Check if all models are fitted
+        for i, tree in enumerate(self.trees):
+            try:
+                check_is_fitted(tree)
+            except Exception as e:
+                raise ValueError(f"Model for agent {i} not fitted. Call fit_models() first.") from e
+
+        # Get feature importances for all agents
+        all_importances = []
+        tree_importances = []
+        linear_importances = []
+        
+        for i, (tree, linear_model) in enumerate(zip(self.trees, self.linear_models)):
+            tree_importance = tree.feature_importances_
+            linear_importance = linear_model.coef_ if hasattr(linear_model, 'coef_') else np.zeros(self.input_dim)
+            combined_importance = (tree_importance + linear_importance) / 2
+            
+            all_importances.append(combined_importance)
+            tree_importances.append(tree_importance)
+            linear_importances.append(linear_importance)
+        
+        all_importances = np.array(all_importances)
+        tree_importances = np.array(tree_importances)
+        linear_importances = np.array(linear_importances)
+        
+        # Create summary statistics
+        mean_importance = np.mean(all_importances, axis=0)
+        std_importance = np.std(all_importances, axis=0)
+        max_importance = np.max(all_importances, axis=0)
+        min_importance = np.min(all_importances, axis=0)
+        
+        # Create the summary plot
+        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(16, 12))
+        
+        # Mean importance with error bars
+        feature_indices = np.arange(len(mean_importance))
+        ax1.errorbar(feature_indices, mean_importance, yerr=std_importance, 
+                    fmt='o-', alpha=0.7, capsize=3)
+        ax1.set_xlabel('Feature Index')
+        ax1.set_ylabel('Mean Feature Importance')
+        ax1.set_title('Mean Feature Importance Across Agents', fontsize=12)
+        ax1.grid(True, alpha=0.3)
+        
+        # Box plot of importance distribution
+        ax2.boxplot(all_importances.T, labels=[f'Agent {i}' for i in range(len(self.agents))])
+        ax2.set_xlabel('Agent')
+        ax2.set_ylabel('Feature Importance')
+        ax2.set_title('Feature Importance Distribution by Agent', fontsize=12)
+        ax2.grid(True, alpha=0.3)
+        
+        # Max vs Min importance
+        ax3.scatter(min_importance, max_importance, alpha=0.6)
+        ax3.plot([min_importance.min(), min_importance.max()], 
+                [min_importance.min(), min_importance.max()], 'r--', alpha=0.5)
+        ax3.set_xlabel('Minimum Importance')
+        ax3.set_ylabel('Maximum Importance')
+        ax3.set_title('Max vs Min Feature Importance', fontsize=12)
+        ax3.grid(True, alpha=0.3)
+        
+        # Tree vs Linear importance correlation
+        mean_tree = np.mean(tree_importances, axis=0)
+        mean_linear = np.mean(linear_importances, axis=0)
+        ax4.scatter(mean_tree, mean_linear, alpha=0.6)
+        ax4.set_xlabel('Mean Tree Importance')
+        ax4.set_ylabel('Mean Linear Importance')
+        ax4.set_title('Tree vs Linear Model Importance', fontsize=12)
+        ax4.grid(True, alpha=0.3)
+        
+        plt.suptitle('Feature Importance Summary Across All Agents', fontsize=16)
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        
+        if show_plot:
+            plt.show()
+        else:
+            plt.close()
+        
+        return fig
+
+    def collect_training_data(self, num_samples: int = 1000):
+        """Collect training data by running the environment and gathering Q-values from agents.
+        
+        Args:
+            num_samples (int): Number of training samples to collect. Defaults to 1000.
+        """
+        from tqdm import tqdm
+        
+        for _ in tqdm(range(num_samples), desc="Collecting training samples"):
+            obs = self.env.get_observations()
+            obs_tensor = torch.as_tensor(obs, dtype=torch.float, device=self.device)
+            
+            # Get Q-values from all agents
+            q_values = []
+            for agent in self.agents:
+                with torch.no_grad():
+                    q_vals = agent.get_q_net()(obs_tensor).cpu().numpy()
+                    # Take the maximum Q-value for each agent
+                    q_values.append(np.max(q_vals, axis=1))
+            q_values = np.array(q_values).T  # Shape: (batch_size, n_agents)
+            
+            # Reshape observation to 2D array (flatten all dimensions except batch)
+            obs_reshaped = obs.reshape(obs.shape[0], -1)  # This will give us (batch_size, features)
+            self.add_training_data(obs_reshaped, q_values)
+            
+            # Take a random action to get new observations
+            action = self.env.action_space.sample()
+            state, reward_dict, terminated, truncated, info = self.env.step(action)
+            if terminated:
+                self.env.reset()
