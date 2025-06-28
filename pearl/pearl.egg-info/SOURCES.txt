@@ -1,0 +1,5 @@
+setup.py
+pearl.egg-info/PKG-INFO
+pearl.egg-info/SOURCES.txt
+pearl.egg-info/dependency_links.txt
+pearl.egg-info/top_level.txt
